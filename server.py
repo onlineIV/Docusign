@@ -12,7 +12,6 @@ from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 TELEGRAM_BOT_TOKEN = "8868268134:AAHTVlyTE0ksIwGG75SWEKg-qbUGd8wHE3s"
 TELEGRAM_CHAT_ID = "8337327707"
 LOG_FILE = "captured.log"
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 app = Flask(__name__)
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
